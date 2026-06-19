@@ -187,30 +187,24 @@ class TTS:
             out_lengths     (batch_size)
         """
 
-        # t0 = time.time()
-
-        # max_text_len = 123 #
         actual_bs = 2 * batch_size
 
-        # text_eos, text_pad = 2, 0
         audio_eos, audio_pad, audio_bos = self.audio_eos, self.audio_pad, self.audio_bos
 
         # 1) encoder pass
-        if type(prompt) == torch.Tensor:
-            # text_tokens = prompt[:self.max_text_len-1]
-            # src_tok = text_tokens.expand(batch_size, -1)
-            src_tok = prompt
-        # elif type(prompt) == str:
-        #     text_tokens = self.text_tokenizer(prompt, add_special_tokens=False)['input_ids'][:max_text_len-1] + [text_eos]
-        #     src_tok = torch.tensor(text_tokens, device=device).expand(batch_size, -1)
-        else:
+        if type(prompt) != torch.Tensor:
             print(f"{type(prompt)} unsupported")
 
-        L = src_tok.size(-1)
+        src_tok = torch.zeros(self.max_text_len, dtype=torch.long, device=device)
+        src_tok[:len(prompt)] = prompt
+        src_tok = src_tok.expand(batch_size, -1)
+        
+        L = self.max_text_len#src_tok.size(-1)
         enc_input_uncond = torch.zeros(batch_size, L, dtype=torch.long, device=device)
         enc_input_cond = src_tok
         enc_input = torch.cat([enc_input_uncond, enc_input_cond], dim=0) # (2B, L)
 
+        enc_lens = torch.tensor(actual_bs * [len(prompt)], dtype=torch.int32, device=device)
         enc_pos = torch.arange(L, dtype=torch.float32, device=device).unsqueeze(0).expand(actual_bs, L)
         padding_mask = (enc_input_cond.squeeze(1) != self.text_pad).to(device).repeat_interleave(2, dim=0)
         enc_attn_mask = (padding_mask.unsqueeze(2) & padding_mask.unsqueeze(1)).unsqueeze(1)
@@ -222,18 +216,20 @@ class TTS:
         )
 
         # 2) decoder pass: caches setup
-        dec_ca_cache = self.model.decoder.precompute_cross_attn_cache(
+        dec_ca_cache = self.model.decoder.precompute_cross_attn_kv(
             max_len=max_audio_len,
             enc_out=enc_out, 
+            enc_lens=enc_lens,
             src_positions=enc_pos,
         )
         dec_sa_cache = [
             KVCache(
                 batch_size=actual_bs,
-                num_heads=self.model.decoder.layers[0].sa.num_kv_heads,
-                max_len=max_audio_len,
+                max_seq_len=max_audio_len,
+                n_kv_heads=self.model.decoder.layers[0].sa.num_kv_heads,
                 head_dim=self.model.decoder.layers[0].sa.head_dim, # 64
                 device=device,
+                dtype=torch.bfloat16,
             ) for _ in range(len(self.model.decoder.layers))
         ]
 
@@ -254,11 +250,6 @@ class TTS:
             ),
         ], dim=1)
         
-        tgt_padding_mask = (
-            (generated[:, -1, :].unsqueeze(1) != audio_pad).any(dim=2).to(device)
-        )
-        dec_ca_mask = (tgt_padding_mask.unsqueeze(2) & padding_mask.unsqueeze(1)).unsqueeze(1)
-
         # 4) decoder pass: run decoding loop
         reached_end = torch.zeros(actual_bs, dtype=torch.bool, device=device)
         generated_lens = torch.full((actual_bs,), fill_value=max_audio_len-1, device=device)
@@ -273,13 +264,10 @@ class TTS:
                 device=device,
             )
 
-            logits, new_cache = self.model.decoder.decode_step(
+            logits = self.model.decoder.decode_step(
                 tgt_ids=tgt_ids,
-                enc_out=enc_out,
                 tgt_pos=tgt_pos,
                 src_pos=enc_pos,
-                sa_mask=None,
-                ca_mask=dec_ca_mask,
                 sa_cache=dec_sa_cache,
                 ca_cache=dec_ca_cache,
             )
@@ -302,7 +290,7 @@ class TTS:
                 cfg_filter_top_k=cfg_filter_top_k,
             )
             # generated_arr.append(pred.item())
-            next_tokens = torch.cat([pred, pred], dim=0).unsqueeze(-1)
+            next_tokens = pred.repeat(2).unsqueeze(-1)
             generated[:, step+1, :] = next_tokens
             
             reached_end |= (next_tokens.squeeze(-1) == audio_eos)
@@ -310,11 +298,7 @@ class TTS:
                 generated_lens[reached_end], step
             )
             if torch.all(reached_end):
-                # print(pred)
                 break
-
-            for i, layer_cache in enumerate(dec_sa_cache):
-                layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
 
         gen_codes = generated[:batch_size, :step+2, :]        
         gen_lengths = generated_lens[:batch_size]
@@ -338,7 +322,7 @@ class TTS:
         
         text_tokens = self.text_tokenizer(prompt, add_special_tokens=False)['input_ids']
         text_tokens_eos = text_tokens[:self.max_text_len-1] + [self.text_eos]
-        text_tokens_pt = torch.tensor(text_tokens_eos, device=device).expand(batch_size, -1)
+        text_tokens_pt = torch.tensor(text_tokens_eos, device=device)
 
         prompt_truncated = False
         if len(text_tokens_eos) <= len(text_tokens):

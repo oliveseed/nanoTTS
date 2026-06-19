@@ -1,19 +1,23 @@
 '''
-Implements a encoder-decoder Transformer model:
-- standard rope and kv cache
-- efficient varlen attention for training
+Contains the model definition for both training and inference paths
+
+Implements:
+- standard rope
+- flash attention kv cache for inference
+- varlen attention for training
 - swiglu or relu^2 mlp
 - fused qkv
 - gqa
 - qk norm
 '''
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import RMSNorm
 from torch.nn.attention.varlen import varlen_attn
-import math
+from flash_attn.flash_attn_interface import flash_attn_with_kvcache
 
 #import ipdb
 
@@ -67,40 +71,21 @@ class RotaryEmbedding(nn.Module):
 
 
 class KVCache:
-    """
-    Basic KV cache
-    """
-    
-    def __init__(self, num_heads, max_len, head_dim, device, batch_size=None, k=None, v=None):
-        if (batch_size is None) and (k is None or v is None):
-            raise Exception("batch size and kv can't both be None")
-        self.k = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device, dtype=torch.bfloat16) if k is None else k
-        self.v = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device, dtype=torch.bfloat16) if v is None else v
-        self.current_idx = 0
-        self.max_len = max_len
+    def __init__(
+        self, batch_size, max_seq_len, n_kv_heads, head_dim, device, dtype,
+        k=None, v=None, seqlens=None,
+    ):
+        self.k = torch.empty(
+            batch_size, max_seq_len, n_kv_heads, head_dim, device=device, dtype=dtype,
+        ) if k is None else k
 
-    def get_kv_for_attention(self, current_k, current_v):
-        if self.current_idx == 0:
-            return current_k, current_v
-        else:
-            past_k = self.k[:, :, : self.current_idx, :]
-            past_v = self.v[:, :, : self.current_idx, :]
-            attn_k = torch.cat((past_k, current_k), dim=2)
-            attn_v = torch.cat((past_v, current_v), dim=2)
-            return attn_k, attn_v
+        self.v = torch.empty(
+            batch_size, max_seq_len, n_kv_heads, head_dim, device=device, dtype=dtype,
+        ) if v is None else v
 
-    def update_cache(self, k, v):
-        assert self.current_idx < self.max_len
-        self.k[:, :, self.current_idx : self.current_idx + 1, :] = k
-        self.v[:, :, self.current_idx : self.current_idx + 1, :] = v
-        self.current_idx += 1
-
-    def prefill(self, k, v):
-        prefill_len = k.shape[2]
-        assert prefill_len <= self.max_len
-        self.k[:, :, :prefill_len, :] = k
-        self.v[:, :, :prefill_len, :] = v
-        self.current_idx = prefill_len
+        self.seqlens = torch.zeros(
+            batch_size, dtype=torch.int32, device=device,
+        ) if seqlens is None else seqlens
 
 
 class MLP(nn.Module):#swiglu
@@ -153,16 +138,9 @@ class GQA(nn.Module):
 
         # explicitly set bf16 because https://github.com/pytorch/pytorch/issues/167308
         # or else it won't use fused rmsnorm and will be slower
-        self.norm_q = RMSNorm(
-            head_dim,
-            eps=1e-5,
-            dtype=torch.bfloat16,
-        )
-        self.norm_k = RMSNorm(
-            head_dim,
-            eps=1e-5,
-            dtype=torch.bfloat16,
-        )
+        # TODO: some parts still have fp32 rmsnorm
+        self.norm_q = RMSNorm(head_dim, eps=1e-5, dtype=torch.bfloat16)
+        self.norm_k = RMSNorm(head_dim, eps=1e-5, dtype=torch.bfloat16)
         
         self.rotary_emb = RotaryEmbedding(
             embedding_dims=head_dim,
@@ -176,12 +154,8 @@ class GQA(nn.Module):
         q, k, v = torch.split(qkv, [self.q_proj_dim, self.kv_proj_dim, self.kv_proj_dim], dim=-1)
         return q, k, v
 
-    def forward_inference(
-        self, x, pos,
-        attn_mask, cache=None, prefill=False,
-    ):
+    def forward_inference(self, x, pos, attn_mask=None, cache=None):#, prefill=False):
         batch_size, seq_len, _ = x.shape
-        # orig_dtype = x.dtype
 
         q, k, v = self._project_qkv(x)
         q = q.view(batch_size, seq_len, self.num_query_heads, self.head_dim)   # (B, T, N, H)
@@ -194,39 +168,38 @@ class GQA(nn.Module):
         q = self.rotary_emb(q, pos)
         k = self.rotary_emb(k, pos)
 
-        q = q.transpose(1, 2)   # (B, N, S, H)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        attn_k: torch.Tensor | None = cache.k if cache is not None else None
-        attn_v: torch.Tensor | None = cache.v if cache is not None else None
-        new_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
-        if cache is None:
-            attn_k, attn_v = k, v
-        elif prefill:
-            attn_k, attn_v = k, v
-            cache.prefill(attn_k, attn_v)
+        if cache is not None:
+            # decoder self-attn requires kvcache at inference
+            # q, k, v: (B, S, N, H)
+            attn_output = flash_attn_with_kvcache(
+                q=q,
+                k_cache=cache.k,
+                v_cache=cache.v,
+                k=k,
+                v=v,
+                cache_seqlens=cache.seqlens,
+                causal=True,
+            )
+            cache.seqlens += k.shape[1] # should be same as += 1
         else:
-            new_kv_cache = k, v
-            attn_k, attn_v = cache.get_kv_for_attention(k, v)
-
-        attn_output = F.scaled_dot_product_attention(
-            q, attn_k, attn_v,
-            attn_mask=attn_mask,
-            # scale=1.0,
-            enable_gqa=self.num_gqa_groups > 1,
-        )   # (B, N, S, H)
+            # encoder self-attn does not use kvcache
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            # q, k, v: (B, N, S, H)
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                # scale=1.0,
+                enable_gqa=self.num_gqa_groups > 1,
+            )   # (B, N, S, H)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.q_embed_dim)
         output = self.out_proj(attn_output)
 
-        #return output.to(orig_dtype), new_kv_cache
-        return output, new_kv_cache
+        return output
 
-    def forward(
-        self, x, pos,
-        cu_seq, max_len, is_causal,
-    ):
+    def forward(self, x, pos, cu_seq, max_len, is_causal):
         # orig_dtype = x.dtype
 
         q, k, v = self._project_qkv(x)
@@ -284,16 +257,8 @@ class GQCA(nn.Module):
         self.kv_proj = nn.Linear(kv_embed_dim, 2 * self.kv_proj_dim, bias=False)
         self.out_proj = nn.Linear(num_query_heads * head_dim, out_embed_dim, bias=False)
         
-        self.norm_q = RMSNorm(
-            head_dim,
-            eps=1e-5,
-            dtype=torch.bfloat16,
-        )
-        self.norm_k = RMSNorm(
-            head_dim,
-            eps=1e-5,
-            dtype=torch.bfloat16,
-        )
+        self.norm_q = RMSNorm(head_dim, eps=1e-5, dtype=torch.bfloat16)
+        self.norm_k = RMSNorm(head_dim, eps=1e-5, dtype=torch.bfloat16)
 
         self.rotary_emb = RotaryEmbedding(
             embedding_dims=head_dim,
@@ -307,40 +272,25 @@ class GQCA(nn.Module):
         k, v = torch.split(kv, [self.kv_proj_dim, self.kv_proj_dim], dim=-1)
         return k, v
 
-    def forward_inference(
-        self, xq, xkv, q_pos, kv_pos,
-        attn_mask, cache,
-    ):
+    def forward_inference(self, xq, q_pos, cache):
         batch_size, seq_len_q, _ = xq.shape
-        _, seq_len_kv, _ = xkv.shape
-        # orig_dtype = xq.dtype
 
-        q = self.q_proj(xq).view(batch_size, seq_len_q, self.num_query_heads, self.head_dim)   # (B, T, N, H)
-        k, v = self._project_kv(xkv)
-        k = k.view(batch_size, seq_len_kv, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len_kv, self.num_kv_heads, self.head_dim)
-
+        q = self.q_proj(xq).view(batch_size, seq_len_q, self.num_query_heads, self.head_dim)
         q = self.norm_q(q)
-        k = self.norm_k(k)
-
         q = self.rotary_emb(q, q_pos)
-        k = self.rotary_emb(k, kv_pos)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            # scale=1.0,
-            enable_gqa=self.num_gqa_groups > 1,
+        # q: (B, T, N, H)
+        attn_output = flash_attn_with_kvcache(
+            q=q,
+            k_cache=cache.k,
+            v_cache=cache.v,
+            cache_seqlens=cache.seqlens,
+            causal=False,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len_q, self.q_embed_dim)   # cross attn uses query shapes
         output = self.out_proj(attn_output)
 
-        return output#.to(orig_dtype)
+        return output
 
     def forward(
         self, xq, xkv, q_pos, kv_pos,
@@ -392,11 +342,7 @@ class EncoderLayer(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-        self.pre_norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
+        self.pre_norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
         self.sa = GQA(
             q_embed_dim=embed_dim,
             kv_embed_dim=embed_dim,
@@ -406,39 +352,31 @@ class EncoderLayer(nn.Module):
             head_dim=head_dim,
             compute_dtype=torch.float32,
         )
-        self.post_norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
+
+        self.post_norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
         self.mlp = MLP(
             in_dim=embed_dim,
             hidden_dim=expand_dim,
         )
 
-    def forward_inference(
-        self, x, pos, attn_mask=None, cache=None, prefill=False,
-    ):
+    def forward_inference(self, x, pos, attn_mask=None):#, prefill=False,):
         residual = x
         x_norm = self.pre_norm(x)
-        attn_out, _ = self.sa.forward_inference(
+        attn_out = self.sa.forward_inference(
             x=x_norm,
             pos=pos,
             attn_mask=attn_mask,
-            cache=cache,
-            prefill=prefill,
+            cache=None,
+            # prefill=prefill,
         )
         x = residual + attn_out
         residual = x
         x_norm = self.post_norm(x)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
-
         return x
 
-    def forward(
-        self, x, pos, cu_seq, max_len,
-    ):
+    def forward(self, x, pos, cu_seq, max_len):
         residual = x
         x_norm = self.pre_norm(x)
         attn_out = self.sa(
@@ -453,7 +391,6 @@ class EncoderLayer(nn.Module):
         x_norm = self.post_norm(x)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
-
         return x
 
 
@@ -494,30 +431,21 @@ class Encoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
+        self.norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
 
-    def forward_inference(
-        self, x_ids, pos, attn_mask=None, cache=None, prefill=False,
-    ):
+    def forward_inference(self, x_ids, pos, attn_mask=None):#, prefill=False,):
         x = self.embedding(x_ids)
         for layer in self.layers:
             x = layer.forward_inference(
                 x=x,
                 pos=pos,
                 attn_mask=attn_mask,
-                cache=cache,
-                prefill=prefill,
+                # prefill=prefill,
             )
         x = self.norm(x)
         return x
 
-    def forward(
-        self, x_ids, pos, cu_seq, max_len,
-    ):
+    def forward(self, x_ids, pos, cu_seq, max_len):
         x = self.embedding(x_ids)
         for layer in self.layers:
             x = layer(
@@ -551,21 +479,9 @@ class DecoderLayer(nn.Module):
         self.head_dim = head_dim
         self.norm_eps = norm_eps
 
-        self.pre_sa_norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
-        self.pre_ca_norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
-        self.pre_mlp_norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
+        self.pre_sa_norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
+        self.pre_ca_norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
+        self.pre_mlp_norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
 
         self.sa = GQA(
             q_embed_dim=embed_dim,
@@ -590,32 +506,19 @@ class DecoderLayer(nn.Module):
             hidden_dim=expand_dim,
         )
 
-    def forward_inference(
-        self, x, enc_out,
-        enc_kv_pos, dec_q_pos,
-        sa_cache, ca_cache, sa_mask=None, ca_mask=None, prefill=False,
-    ):
+    def forward_inference(self, x, enc_kv_pos, dec_pos, sa_cache, ca_cache):
         residual = x
         x_norm = self.pre_sa_norm(x)
 
-        sa_out, new_kv_cache = self.sa.forward_inference(
-            x=x_norm,
-            pos=dec_q_pos,
-            attn_mask=sa_mask,
-            cache=sa_cache,
-            prefill=prefill,
+        sa_out = self.sa.forward_inference(
+            x=x_norm, pos=dec_pos, cache=sa_cache, # prefill=prefill,
         )
         x = residual + sa_out
 
         residual = x
         x_norm = self.pre_ca_norm(x)
         ca_out = self.ca.forward_inference(
-            xq=x_norm,
-            xkv=enc_out,
-            q_pos=dec_q_pos,
-            kv_pos=enc_kv_pos,
-            attn_mask=ca_mask,
-            cache=ca_cache,
+            xq=x_norm, q_pos=dec_pos, cache=ca_cache,
         )
         x = residual + ca_out
 
@@ -624,7 +527,7 @@ class DecoderLayer(nn.Module):
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
 
-        return x, new_kv_cache
+        return x
 
     def forward(
         self, x, enc_out, 
@@ -705,19 +608,16 @@ class Decoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.norm = RMSNorm(
-            embed_dim,
-            eps=norm_eps,
-            dtype=torch.float32,
-        )
+        self.norm = RMSNorm(embed_dim, eps=norm_eps, dtype=torch.float32)
 
         self.logits_proj = nn.Linear(embed_dim, vocab_size, bias=False)
         # self.logits_proj.weight = self.embeddings.weight
 
-    def precompute_cross_attn_cache(
+    def precompute_cross_attn_kv(
         self,
         max_len: int,
         enc_out: torch.Tensor,  # (B, S, E)
+        enc_lens: torch.Tensor,
         src_positions: torch.Tensor,
     ) -> list[KVCache]:
         """
@@ -729,22 +629,24 @@ class Decoder(nn.Module):
 
         for layer in self.layers:
             cross_attn_module = layer.ca
-            k_proj, v_proj = cross_attn_module._project_kv(enc_out)
-            k_proj = k_proj.view(batch_size, seq_len, cross_attn_module.num_kv_heads, cross_attn_module.head_dim)
-            v_proj = v_proj.view(batch_size, seq_len, cross_attn_module.num_kv_heads, cross_attn_module.head_dim)
+            k, v = cross_attn_module._project_kv(enc_out)
+            k = k.view(batch_size, seq_len, cross_attn_module.num_kv_heads, cross_attn_module.head_dim)
+            v = v.view(batch_size, seq_len, cross_attn_module.num_kv_heads, cross_attn_module.head_dim)
 
-            k_proj = cross_attn_module.rotary_emb(k_proj, position=src_positions)
-            k = k_proj.transpose(1, 2)
-            v = v_proj.transpose(1, 2)
+            k = cross_attn_module.norm_k(k)
+            k = cross_attn_module.rotary_emb(k, position=src_positions)
 
             per_layer_kv_cache.append(
                 KVCache(
-                    num_heads=cross_attn_module.num_kv_heads,
-                    max_len=max_len,
+                    batch_size=batch_size,
+                    max_seq_len=max_len,
+                    n_kv_heads=cross_attn_module.num_kv_heads,
                     head_dim=cross_attn_module.head_dim,
                     device=k.device,
+                    dtype=torch.bfloat16,
                     k=k,
                     v=v,
+                    seqlens=enc_lens,
                 )
             )
 
@@ -752,12 +654,9 @@ class Decoder(nn.Module):
 
     def decode_step(
         self,
-        enc_out,
         src_pos,
         tgt_ids,
         tgt_pos,
-        sa_mask,
-        ca_mask,
         sa_cache,
         ca_cache,
     ):
@@ -768,26 +667,17 @@ class Decoder(nn.Module):
 
         x = self.embeddings(tgt_ids)
 
-        new_cache = []
-
         for i, layer in enumerate(self.layers):
-            self_cache = sa_cache[i]
-            cross_cache = ca_cache[i]
-            x, new_kv_cache = layer.forward_inference(
+            x = layer.forward_inference(
                 x=x,
-                enc_out=enc_out, # can set none when cache properly implemented
                 enc_kv_pos=src_pos,
-                dec_q_pos=tgt_pos,
-                # dec_kv_pos=tgt_pos,
-                sa_cache=self_cache,
-                ca_cache=cross_cache,
-                sa_mask=sa_mask,
-                ca_mask=ca_mask,
+                dec_pos=tgt_pos,
+                sa_cache=sa_cache[i],
+                ca_cache=ca_cache[i],
             )
-            new_cache.append(new_kv_cache)
         x = self.norm(x)
         logits = self.logits_proj(x)
-        return logits, new_cache
+        return logits
   
     def forward(
         self,
