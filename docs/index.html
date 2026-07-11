@@ -1,3 +1,252 @@
 <!DOCTYPE html>
 <html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nanoTTS</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            color: #333;
+            line-height: 1.6;
+            padding: 40px 20px;
+            background-color: #fff;
+        }
+        .container {
+            max-width: 850px;
+            margin: 0 auto;
+        }
+        h1 {
+            font-size: 2.2em;
+            font-weight: 400;
+            margin-bottom: 25px;
+            color: #1a202c;
+        }
+        .subtitle {
+            font-size: 1.4em;
+            margin-bottom: 20px;
+            color: #2d3748;
+        }
+        .buttons {
+            margin-bottom: 30px;
+            display: flex;
+            gap: 12px;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #3182ce;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 0.95em;
+        }
+        .btn:hover {
+            background-color: #2b6cb0;
+        }
+        ul {
+            padding-left: 20px;
+            color: #4a5568;
+            margin-bottom: 40px;
+            font-size: 1.05em;
+        }
+        li {
+            margin-bottom: 8px;
+        }
+        strong {
+            color: #2d3748;
+        }
+        code {
+            background-color: #f7fafc;
+            padding: 2px 6px;
+            border: 1px solid #e2e8f0;
+            border-radius: 4px;
+            font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.9em;
+            color: #4a5568;
+        }
+        hr {
+            border: 0;
+            border-top: 1px solid #e2e8f0;
+            margin: 40px 0;
+        }
+        h2 {
+            font-size: 1.8em;
+            font-weight: 400;
+            margin-top: 30px;
+            margin-bottom: 25px;
+            color: #1a202c;
+        }
+        .example {
+            margin-bottom: 40px;
+        }
+        .example-text {
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #1a202c;
+        }
+        .example-text span {
+            font-weight: 400;
+        }
+        .audio-container {
+            display: flex;
+            gap: 60px;
+        }
+        .audio-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .audio-label {
+            font-size: 0.85em;
+            color: #718096;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        audio {
+            height: 40px;
+            outline: none;
+            border-radius: 30px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>nanoTTS 0.5B ⚡</h1>
+        
+        <div class="subtitle">Comparison between nanoTTS and OpenAI GPT-4o mini TTS</div>
+
+        <div class="buttons">
+            <a href="https://github.com/oliveseed/nanoTTS" class="btn">Github Code</a>
+            <!--<a href="#" class="btn">🤗 Weights</a>-->
+            <a href="https://huggingface.co/spaces/ouasdg/nanoTTS" class="btn">🤗 Live Demo</a>
+        </div>
+
+        <ul>
+            <li><strong>Architecture:</strong> 500M encoder-decoder autoregressive Transformer.</li>
+            <li><strong>Inference:</strong> Generates up to 30 seconds at 3.5x realtime and fits in 8 GB VRAM in bf16</li>
+            <li><strong>Codec and output format:</strong> Stable Codec, 16 kHz mono waveform.</li>
+            <li><strong>Training data:</strong> A ~12,000 hour English-only subset of Emilia-YODAS.</li>
+            <li><strong>Voices:</strong> Randomly chosen, or voice cloning</li>
+        </ul>
+
+        <hr>
+
+        <h2>Examples</h2>
+
+        <div class="example">
+            <div class="example-text">
+                Basic text: <span>"Number 15, Burger King foot lettuce. The last thing you'd want in your Burger King burger is someone's foot fungus. But as it turns out, that might be what you get."</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out1.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_1.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Expressiveness: <span>"woah! what the hell was that? did you see what i just saw? it was absolutely crazy, i've never seen anything like it. wait i think i caught it on camera, let me see. oh yes i did. here, look"</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out2.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_2.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Numbers and symbols: <span>"Serving as an empirical existence proof of efficient pretraining, a 1B-parameter HRM-Text model trained from scratch on only 40 billion unique tokens and $1,500 budget achieves 60.7% on MMLU, 81.9% on ARC-C, 82.2% on DROP, 84.5% on GSM8K, and 56.2% on MATH."</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out7.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_7.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Phone call: <span>"Hi Jenny, this is a reminder that you have an appointment scheduled with Dr. Nguyen on Monday, September 21st at 2:30 PM. Please arrive 15 minutes early to complete any updated paperwork. If you need to reschedule, please call 204-867-5309 to let us know."</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out5.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_5.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Lyrics: <span>"Do you remember\nThe 21st night of September?\nLove was changin' the minds of pretenders\nWhile chasin' the clouds away"</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out4.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_4.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Heteronyms: <span>"I read that you can record a record and read it."</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out6.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_6.mp3"></audio>
+                </div>
+            </div>
+        </div>
+
+        <div class="example">
+            <div class="example-text">
+                Failure case: <span>"Switching to variable-bitrate (VBR) is cutting our average file sizes by almost 1/3. Given how much audio we're serving each month, that should save us somewhere around $7.5K-$8K a year."</span>
+            </div>
+            <div class="audio-container">
+                <div class="audio-box">
+                    <span class="audio-label">nanoTTS</span>
+                    <audio controls src="assets/nanotts_out3.wav"></audio>
+                </div>
+                <div class="audio-box">
+                    <span class="audio-label">OpenAI TTS</span>
+                    <audio controls src="assets/openai_3.mp3"></audio>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
 </html>
